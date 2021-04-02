@@ -21,6 +21,8 @@ ini-файл
 ;*********************************
 [main]
 ;*********************************
+; this file version, should be the same as program version
+ini_file_version = 02.04.2021
 ; instrument description file, default instrument_description.json
 ; json-file with field 'IP_address' - contains ITO ip address, used to reboot it
 ; should be in %data_dir_path% folder
@@ -29,6 +31,11 @@ instrument_description_filename = instrument_description.json
 ITO_rebooting_duration_sec = 40
 ; pause after stopping the service, default 10
 win_service_restart_pause = 10
+; power control device (Netping) IP-address, if empty device wont be used
+netping_relay_address = 10.0.0.56
+; socket num (1 or 2) ITO is connected to
+netping_relay_ito_socket_num = 2
+
 ;*********************************
 [trigger1]
 ;*********************************
@@ -70,7 +77,7 @@ import win32api
 import configparser
 from netpingrelay import NetpingRelay
 
-program_version = '01.04.2021'
+program_version = '02.04.2021'
 
 # Глобальные переменные
 files_template = '*.txt'  # шаблон имени файла для подсчета размера папки
@@ -78,12 +85,6 @@ instrument_description_filename = 'instrument_description.json'  # имя фай
 ITO_rebooting_duration_sec = 40  # время перезагрузки прибора
 win_service_restart_pause = 10  # пауза при перезапуске службы
 ito_ip = ''
-
-# Перекочует в ini
-netping_relay_address = '10.0.0.56'  # адрес управляемой розетки
-netping_relay_ito_socket_num = 2  # номер розетки, в которую воткнут ИТО
-ITO_reboot_min_interval_sec = 3600  # минимальный интервал между перезагрузками прибора (при отсутствии связи)
-ITO_reboot_max = 3  # максимальное количество перезагрузок прибора, сбрасывается при успешной связи с прибором
 
 ito_reboot_param = {'last_check_time': 0.0,
                       'check_interval_desired': 3600, 'check_interval_actual': 3600, 'check_interval_multiplier': 2,
@@ -274,6 +275,8 @@ if __name__ == "__main__":
     num_of_triggers_before_action = 5  # количество срабатываний триггера до перезапуска службы
     win_service_restart_interval_sec = 3600  # интервал безусловной перезагрузки службы
     num_of_service_restarts_before_ito_reboot = 0  # количество перезапусков службы до перезагрузки прибора
+    netping_relay_address = ''
+    netping_relay_ito_socket_num = 0
 
     try:
         filename, file_extension = os.path.splitext(sys.argv[0])
@@ -285,9 +288,12 @@ if __name__ == "__main__":
 
         config.read(ini_file_name)
 
+        ini_file_version = config['main']['ini_file_version']
         instrument_description_filename = config['main']['instrument_description_filename']
         ITO_rebooting_duration_sec = float(config['main']['ITO_rebooting_duration_sec'])
         win_service_restart_pause = float(config['main']['win_service_restart_pause'])
+        netping_relay_address = config['main']['netping_relay_address']  # '10.0.0.56'  # адрес управляемой розетки
+        netping_relay_ito_socket_num = int(config['main']['netping_relay_ito_socket_num'])  # номер розетки, в которую воткнут ИТО
 
         data_dir_path = config['trigger1']['data_dir_path']
         instrument_description_filename = data_dir_path + '\\' + instrument_description_filename
