@@ -80,7 +80,7 @@ import win32api
 import configparser
 from netpingrelay import NetpingRelay
 
-program_version = '23.04.2021'
+program_version = '22.04.2021'
 
 # Глобальные переменные
 files_template = '*.txt'  # шаблон имени файла для подсчета размера папки
@@ -170,12 +170,13 @@ def ito_check_connection():
     return ret
 
 
-def action_when_trigger_released(ito_reboot=False):
+def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
     """
     Действия при срабатывании таймера, триггера
     Перезапуск службы, перезапуск ИТО, установка часов ИТО
 
     :param ito_reboot: boolean, ITO reboot permission
+           reboot_by_netping: boolean, True (use Netping relay to reboot ITO reboot) or False(use ITO command #reboot)
     :return:
     """
     global cur_unsuccessful_reboots
@@ -194,46 +195,53 @@ def action_when_trigger_released(ito_reboot=False):
         logging.error(f'Exception during service stop: {e.__doc__}')
 
     # ITO check connection, reboot and clock set
-    if ito_reboot:
+    if ito_reboot and cur_unsuccessful_reboots < max_unsuccessful_reboots:
 
-        logging.info('Check ITO connection...')
-        ito_ok = ito_check_connection()
-        if not ito_ok == True:
-            logging.info(f'No connection: {ito_ok}')
+        # reboot by Netping
+        if reboot_by_netping:
+            logging.info('Reboot by Netping...')
+            try:
+                logging.info('Cheking Netping socket...')
+                relay = NetpingRelay(netping_relay_address)
 
-            # ITO doesn't answer - let's reboot it
-            if cur_unsuccessful_reboots < max_unsuccessful_reboots:
+                relay_ok = relay.check_connection()
+                if relay_ok == True:
+                    logging.info('Netping socket connected.')
+                    logging.info(f'Rebooting ITO by Netping socket...')
+                    relay.reset_socket(netping_relay_ito_socket_num, 20)
+                    relay.socket_on(netping_relay_ito_socket_num)
+                    logging.info(f"Pause for {ITO_rebooting_duration_sec}sec")
+                else:
+                    logging.error(f'Netping socket error: {relay_ok}')
+                    reboot_by_netping = False  # далее будет перезагрузка с помощью команды #reboot
 
-                # reboot by Netping
+            except Exception as e:
+                logging.error(f'An exception happened: {e.__doc__}')
+                
+        if not reboot_by_netping:
+            logging.info('Reboot by #reboot command...')
+            logging.info('Check ITO connection...')
+            ito_ok = ito_check_connection()
+            if ito_ok == True:
                 try:
-                    logging.info('Cheking Netping socket...')
-                    relay = NetpingRelay(netping_relay_address)
-
-                    relay_ok = relay.check_connection()
-                    if relay_ok == True:
-                        logging.info('Netping socket connected.')
-                        logging.info(f'Rebooting ITO by Netping socket...')
-                        relay.reset_socket(netping_relay_ito_socket_num, 20)
-                        relay.socket_on(netping_relay_ito_socket_num)
-                        logging.info(f"Pause for {ITO_rebooting_duration_sec}sec")
-                    else:
-                        logging.error(f'Netping socket error: {relay_ok}')
-
+                    logging.info('ITO reboot...')
+                    h1 = hyperion.Hyperion(ito_ip)
+                    h1.reboot()
                 except Exception as e:
                     logging.error(f'An exception happened: {e.__doc__}')
+            else:
+                logging.info(f'No connection: {ito_ok}')
 
-                # после перезагрузки нужно проверить связь с прибором
-                logging.info('Check ITO connection...')
-                ito_ok = ito_check_connection()
-                if ito_ok:
-                    logging.info('Connection ok')
-
-                    cur_unsuccessful_reboots = 0
-                else:
-                    logging.info(f'No connection: {ito_ok}')
-                    cur_unsuccessful_reboots += 1
-
-                    return False
+        # после перезагрузки нужно проверить связь с прибором
+        logging.info('Check ITO connection...')
+        ito_ok = ito_check_connection()
+        if ito_ok:
+            logging.info('Connection ok')
+            cur_unsuccessful_reboots = 0
+        else:
+            logging.info(f'No connection: {ito_ok}')
+            cur_unsuccessful_reboots += 1
+            return False
 
     # ITO clock set, getting spectra
     logging.info('Check ITO connection...')
@@ -305,6 +313,7 @@ if __name__ == "__main__":
     max_unsuccessful_reboots = 3  # максимальное число перезапусков ИТО (неудачных подряд)
     netping_relay_address = ''
     netping_relay_ito_socket_num = 0
+    reboot_by_netping = True
 
     try:
         filename, file_extension = os.path.splitext(sys.argv[0])
@@ -320,8 +329,6 @@ if __name__ == "__main__":
         instrument_description_filename = config['main']['instrument_description_filename']
         ITO_rebooting_duration_sec = float(config['main']['ITO_rebooting_duration_sec'])
         win_service_restart_pause = float(config['main']['win_service_restart_pause'])
-        netping_relay_address = config['main']['netping_relay_address']  # '10.0.0.56'  # адрес управляемой розетки
-        netping_relay_ito_socket_num = int(config['main']['netping_relay_ito_socket_num'])  # номер розетки, в которую воткнут ИТО
 
         data_dir_path = config['trigger1']['data_dir_path']
         instrument_description_filename = data_dir_path + '\\' + instrument_description_filename
@@ -338,6 +345,12 @@ if __name__ == "__main__":
     except Exception as e:
         print(f'Error during ini-file reading: {str(e)}')
         sys.exit(0)
+
+    try:
+        netping_relay_address = config['main']['netping_relay_address']  # '10.0.0.56'  # адрес управляемой розетки
+        netping_relay_ito_socket_num = int(config['main']['netping_relay_ito_socket_num'])  # номер розетки, в которую воткнут ИТО
+    except KeyError as e:
+        reboot_by_netping = False
 
     # check if data folder exist, create if not - for next log file
     try:
@@ -434,7 +447,7 @@ if __name__ == "__main__":
                             ITO_reboot_now = True
 
                         logging.info(f'Trigger1 released, reboot_ITO={ITO_reboot_now}')
-                        action_when_trigger_released(ITO_reboot_now)
+                        action_when_trigger_released(ito_reboot=ITO_reboot_now, reboot_by_netping=reboot_by_netping)
                         num_of_service_restarts += 1
                     else:
                         cur_num_of_triggers += 1
