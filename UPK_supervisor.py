@@ -54,6 +54,9 @@ dir_check_interval_sec = 60
 num_of_triggers_before_action = 5
 ; how often ITO should be rebooted (0 - never, 1 - every service restart, 2 - every second service restart and so on), default 2
 num_of_service_restarts_before_ito_reboot = 0
+; how many unsuccessful reboots can be made
+max_unsuccessful_reboots = 3
+
 ;*********************************
 [trigger2]
 ;*********************************
@@ -77,7 +80,7 @@ import win32api
 import configparser
 from netpingrelay import NetpingRelay
 
-program_version = '02.04.2021'
+program_version = '23.04.2021'
 
 # Глобальные переменные
 files_template = '*.txt'  # шаблон имени файла для подсчета размера папки
@@ -85,10 +88,7 @@ instrument_description_filename = 'instrument_description.json'  # имя фай
 ITO_rebooting_duration_sec = 40  # время перезагрузки прибора
 win_service_restart_pause = 10  # пауза при перезапуске службы
 ito_ip = ''
-
-ito_reboot_param = {'last_check_time': 0.0,
-                      'check_interval_desired': 3600, 'check_interval_actual': 3600, 'check_interval_multiplier': 2,
-                      'last_action_time': 0.0, 'actions_limit': 5,  'cur_failed_actions': 0}
+cur_unsuccessful_reboots = 0  # число безуспешных перезапусков ИТО
 
 
 def get_dir_size_bytes(template):
@@ -178,6 +178,8 @@ def action_when_trigger_released(ito_reboot=False):
     :param ito_reboot: boolean, ITO reboot permission
     :return:
     """
+    global cur_unsuccessful_reboots
+
     # stop the service
     try:
         logging.info(f'Stopping service {service_name}...')
@@ -190,23 +192,75 @@ def action_when_trigger_released(ito_reboot=False):
         time.sleep(win_service_restart_pause)
     except Exception as e:
         logging.error(f'Exception during service stop: {e.__doc__}')
-        
+
     # ITO check connection, reboot and clock set
-    if ito_reboot and (datetime.datetime.now().timestamp() - ito_reboot_param['last_check_time']) \
-            > ito_reboot_param['check_interval_actual']:
-        ito_reboot_param['last_check_time'] = datetime.datetime.now().timestamp()
+    if ito_reboot:
 
         logging.info('Check ITO connection...')
         ito_ok = ito_check_connection()
-        if ito_ok == True:
-            logging.info('Connection ok')
+        if not ito_ok == True:
+            logging.info(f'No connection: {ito_ok}')
 
-            # интервал проверки можно вернуть на первоначальное значение
-            ito_reboot_param['check_interval_actual'] = ito_reboot_param['check_interval_desired']
+            # ITO doesn't answer - let's reboot it
+            if cur_unsuccessful_reboots < max_unsuccessful_reboots:
+
+                # reboot by Netping
+                try:
+                    logging.info('Cheking Netping socket...')
+                    relay = NetpingRelay(netping_relay_address)
+
+                    relay_ok = relay.check_connection()
+                    if relay_ok == True:
+                        logging.info('Netping socket connected.')
+                        logging.info(f'Rebooting ITO by Netping socket...')
+                        relay.reset_socket(netping_relay_ito_socket_num, 20)
+                        relay.socket_on(netping_relay_ito_socket_num)
+                        logging.info(f"Pause for {ITO_rebooting_duration_sec}sec")
+                    else:
+                        logging.error(f'Netping socket error: {relay_ok}')
+
+                except Exception as e:
+                    logging.error(f'An exception happened: {e.__doc__}')
+
+                # после перезагрузки нужно проверить связь с прибором
+                logging.info('Check ITO connection...')
+                ito_ok = ito_check_connection()
+                if ito_ok:
+                    logging.info('Connection ok')
+
+                    cur_unsuccessful_reboots = 0
+                else:
+                    logging.info(f'No connection: {ito_ok}')
+                    cur_unsuccessful_reboots += 1
+
+                    return False
+
+    # ITO clock set, getting spectra
+    logging.info('Check ITO connection...')
+    ito_ok = ito_check_connection()
+    if ito_ok == True:
+        logging.info('Connection ok')
+
+        # соединение с ИТО
+        try:
+            h1 = hyperion.Hyperion(ito_ip)
+
+            # получение спектров
+            try:
+                logging.info('Getting spectra...')
+                spectrum = h1.spectra
+
+                logging.info('Saving spectra...')
+                k = zip(spectrum.wavelengths, *spectrum.data)
+                spectrum_file_name = datetime.datetime.now().strftime(f'{data_dir_path}\\%Y%m%d%H%M%S_spectrum.txt')
+                with open(spectrum_file_name, 'w') as spectrum_file:
+                    for i in k:
+                        print('\t'.join(str(x) for x in i), file=spectrum_file)
+            except Exception as e:
+                logging.error(f'Some error during getting spectra - exception: {e.__doc__}')
 
             # установка времени прибора
             try:
-                h1 = hyperion.Hyperion(ito_ip)
                 logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
 
                 utcnow = datetime.datetime.utcnow()
@@ -215,45 +269,18 @@ def action_when_trigger_released(ito_reboot=False):
 
                 logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
             except Exception as e:
-                logging.debug(f'Some error during h1.instrument_utc_date_time - exception: {e.__doc__}')
+                logging.error(f'Some error during h1.instrument_utc_date_time - exception: {e.__doc__}')
 
-        else:
-            logging.info(f'No connection: { ito_ok}')
+            # получение температуры прибора
+            try:
+                pass
+            except Exception as e:
+                logging.error(f'Some error during getting temperature - exception: {e.__doc__}')
 
-            # ITO doesn't answer - let's reboot it
-            if ito_reboot_param['cur_failed_actions'] < ito_reboot_param['actions_limit']:
-                try:
-                    logging.info('Cheking Netping socket...')
-                    relay = NetpingRelay(netping_relay_address)
-                    relay_ok = relay.check_connection()
-                    if relay_ok == True:
-                        logging.info('Netping socket connected.')
-                        logging.info(f'Rebooting ITO by Netping socket...')
-                        relay.reset_socket(netping_relay_ito_socket_num, 20)
-                        logging.info(f"Pause for {ITO_rebooting_duration_sec}sec")
-                    else:
-                        logging.error(f'Netping socket error: {relay_ok}')
-
-                except Exception as e:
-                    logging.error(f'An exception happened: {e.__doc__}')
-
-                else:
-                    ito_reboot_param['cur_failed_actions'] += 1
-                    time.sleep(ITO_rebooting_duration_sec)
-
-                # после перезагрузки нужно проверить связь с прибором
-                logging.info('Check ITO connection...')
-                ito_ok = ito_check_connection()
-                if ito_ok:
-                    logging.info('Connection ok')
-
-                    # интервал проверки можно вернуть на первоначальное значение
-                    ito_reboot_param['check_interval_actual'] = ito_reboot_param['check_interval_desired']
-                else:
-                    # перезагрузка не помогла, интервал проверки нужно увеличить
-                    ito_reboot_param['check_interval_actual'] = ito_reboot_param['check_interval_desired'] * \
-                                                                ito_reboot_param['check_interval_multiplier']
-                    return False
+        except Exception as e:
+            logging.error(f'Some error during hyperion.Hyperion({ito_ip}) - exception: {e.__doc__}')
+    else:
+        logging.info(f'No connection: {ito_ok}')
 
     # start the service
     try:
@@ -275,6 +302,7 @@ if __name__ == "__main__":
     num_of_triggers_before_action = 5  # количество срабатываний триггера до перезапуска службы
     win_service_restart_interval_sec = 3600  # интервал безусловной перезагрузки службы
     num_of_service_restarts_before_ito_reboot = 0  # количество перезапусков службы до перезагрузки прибора
+    max_unsuccessful_reboots = 3  # максимальное число перезапусков ИТО (неудачных подряд)
     netping_relay_address = ''
     netping_relay_ito_socket_num = 0
 
@@ -303,6 +331,7 @@ if __name__ == "__main__":
         dir_check_interval_sec = float(config['trigger1']['dir_check_interval_sec'])
         num_of_triggers_before_action = int(config['trigger1']['num_of_triggers_before_action'])
         num_of_service_restarts_before_ito_reboot = int(config['trigger1']['num_of_service_restarts_before_ito_reboot'])
+        max_unsuccessful_reboots = int(config['trigger1']['max_unsuccessful_reboots'])
 
         win_service_restart_interval_sec = float(config['trigger2']['win_service_restart_interval_sec'])
 
@@ -370,7 +399,7 @@ if __name__ == "__main__":
                 last_unconditional_reboot_time = datetime.datetime.now().timestamp()
 
                 logging.info('Trigger2 released')
-                action_when_trigger_released()
+                action_when_trigger_released(False)
 
                 cur_num_of_triggers = 0
                 num_of_service_restarts = 0
@@ -396,7 +425,6 @@ if __name__ == "__main__":
                 logging.info('Speed, [Mb/h]\t%.3f' % cur_speed_mb_per_h)
 
                 if 0.0 <= cur_speed_mb_per_h < dir_size_speed_threshold_mb_per_h:
-                    cur_num_of_triggers += 1
                     if cur_num_of_triggers >= num_of_triggers_before_action:
                         cur_num_of_triggers = 0
 
@@ -408,6 +436,11 @@ if __name__ == "__main__":
                         logging.info(f'Trigger1 released, reboot_ITO={ITO_reboot_now}')
                         action_when_trigger_released(ITO_reboot_now)
                         num_of_service_restarts += 1
+                    else:
+                        cur_num_of_triggers += 1
+                else:
+                    # при успешном триггере сбрасывем счетчик перезапуска ИТО
+                    num_of_service_restarts = 0
 
         except Exception as e:
             logging.error(f'Trigger1 exception: {e.__doc__}')
