@@ -18,51 +18,83 @@ UPK_supervisor
 
 
 ini-файл
+
 ;*********************************
 [main]
 ;*********************************
+
 ; this file version, should be the same as program version
 ini_file_version = 02.04.2021
-; instrument description file, default instrument_description.json
+
+; instrument description file, recommended instrument_description.json
 ; json-file with field 'IP_address' - contains ITO ip address, used to reboot it
 ; should be in %data_dir_path% folder
 instrument_description_filename = instrument_description.json
-; time period needs for ITO rebooting, default 40
+
+; time period needs for ITO rebooting, recommended 40
 ITO_rebooting_duration_sec = 40
-; pause after stopping the service, default 10
+
+; pause after stopping the service, recommended 10
 win_service_restart_pause = 10
+
+;*********************************
+[netping]
+;*********************************
+
 ; power control device (Netping) IP-address, if empty device wont be used
 netping_relay_address = 10.0.0.56
+
 ; socket num (1 or 2) ITO is connected to
 netping_relay_ito_socket_num = 2
 
-;*********************************
-[trigger1]
-;*********************************
-; service name, default OAISKGN_UPK
-service_name = OAISKGN_UPK
-; data folder path, default
-data_dir_path = C:\OAISKGN_UPK\data
-; data files template, default *.txt
-files_template = *.txt
-; minimal data folder size speed when service work normal, default 8
-; less speed means some problems with the service - it will be restarted
-dir_size_speed_threshold_mb_per_h = 8
-; how often data folder should be checked, default 60
-dir_check_interval_sec = 60
-; how many low speed triggers released before service restarts, default 5
-num_of_triggers_before_action = 5
-; how often ITO should be rebooted (0 - never, 1 - every service restart, 2 - every second service restart and so on), default 2
-num_of_service_restarts_before_ito_reboot = 0
-; how many unsuccessful reboots can be made
-max_unsuccessful_reboots = 3
 
 ;*********************************
+; Data folder surveillance - release when new data comes slowly, restars service and reboot ITO if nedeeded
+[trigger1]
+;*********************************
+
+; service name, recommended OAISKGN_UPK
+service_name = OAISKGN_UPK
+
+; data folder path
+data_dir_path = c:\OAISKGN_UPK\data
+
+; data files template, recommended *.txt
+files_template = *.txt
+
+; minimal data folder size speed when service work normal, recommended 8
+; less speed means some problems with the service - it will be restarted
+dir_size_speed_threshold_mb_per_h = 2
+
+; how often data folder should be checked, recommended 60
+dir_check_interval_sec = 3
+
+; how many low speed triggers released before service restarts, recommended 5
+num_of_triggers_before_action = 10
+
+; how often ITO should be rebooted (0 - never, 1 - every service restart, 2 - every second service restart and so on), recommended 2
+num_of_service_restarts_before_ito_reboot = 3
+
+; how many unsuccessful reboots can be made, recommended 3
+max_unsuccessful_reboots = 3
+
+
+
+;*********************************
+; Time trigger - release periodically, restars service doesn't reboot ITO
 [trigger2]
 ;*********************************
-; how often service restarts without any other conditions, default 3600
+
+; how often service restarts without any other conditions, recommended 3600
 ; 0 means never
 win_service_restart_interval_sec = 3600
+
+; ITO time correction when trigger2 released, recommended  1
+; 0 - no correction
+; 1 - UPK (local) UTC-time
+; not released: 2 - OSM UTC-time. Based on log-file where is Ping Frame (opcode=9) from OSM.
+ito_datetime_source = 1
+
 """
 
 import datetime
@@ -80,15 +112,12 @@ import win32api
 import configparser
 from netpingrelay import NetpingRelay
 
-program_version = '22.04.2021'
+program_version = '14.10.2021'
 
 # Глобальные переменные
-files_template = '*.txt'  # шаблон имени файла для подсчета размера папки
-instrument_description_filename = 'instrument_description.json'  # имя файла с описанием оборудования
-ITO_rebooting_duration_sec = 40  # время перезагрузки прибора
-win_service_restart_pause = 10  # пауза при перезапуске службы
-ito_ip = ''
-cur_unsuccessful_reboots = 0  # число безуспешных перезапусков ИТО
+cur_unsuccessful_reboots = 0
+trigger1_enable = False
+trigger2_enable = False
 
 
 def get_dir_size_bytes(template):
@@ -142,7 +171,10 @@ def ito_check_connection():
     """
     Проверка связи с ИТО: пинг порта прибора, затем тестовой командой из API
     :return: True if ITO connected and answer commands
-            reason, str() - error description
+            reason(int), error description(str)
+    reasons: 1 - no ping
+             2 - no connection by ITO API
+             3 - ITO doesn't answer to command #GetChannelDetectionSettingId
     """
 
     ret = True
@@ -170,7 +202,7 @@ def ito_check_connection():
     return ret
 
 
-def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
+def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
     """
     Действия при срабатывании таймера, триггера
     Перезапуск службы, перезапуск ИТО, установка часов ИТО
@@ -194,7 +226,7 @@ def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
     except Exception as e:
         logging.error(f'Exception during service stop: {e.__doc__}')
 
-    # ITO check connection, reboot and clock set
+    # ITO check connection, reboot
     if ito_reboot and cur_unsuccessful_reboots < max_unsuccessful_reboots:
 
         # reboot by Netping
@@ -217,7 +249,7 @@ def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
 
             except Exception as e:
                 logging.error(f'An exception happened: {e.__doc__}')
-                
+
         if not reboot_by_netping:
             logging.info('Reboot by #reboot command...')
             logging.info('Check ITO connection...')
@@ -243,7 +275,7 @@ def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
             cur_unsuccessful_reboots += 1
             return False
 
-    # ITO clock set, getting spectra
+    # ITO setting date/time, getting spectra
     logging.info('Check ITO connection...')
     ito_ok = ito_check_connection()
     if ito_ok == True:
@@ -271,17 +303,34 @@ def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
             try:
                 logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
 
-                utcnow = datetime.datetime.utcnow()
-                logging.info(f'Setting ITO time to UPK-UTC {utcnow.strftime("%d.%m.%Y %H:%M:%S")}')
-                h1.instrument_utc_date_time = utcnow
+                if ito_datetime_source > 0:
+                    datetime_to_be_set = datetime.datetime.utcnow()
 
-                logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
+                    # 1 - UPK (local) UTC-time
+                    if ito_datetime_source == 1:
+                        datetime_to_be_set = datetime.datetime.utcnow()
+                        logging.info(f'Setting ITO time based on UPK(UTC) {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
+
+                    # 2 - OSM UTC-time. Based on log-file where is Ping Frame (opcode=9) from OSM.
+                    if ito_datetime_source == 2:
+                        # Last log file should contain line with Ping Frame (opcode=9) from OSM.
+                        #  "protocol.py[LINE:1053]# DEBUG    [2021-08-31 14:51:27,887]  server < Frame(fin=True, opcode=9, data=b'31.08.2021 14:55:54', rsv1=False, rsv2=False, rsv3=False)"
+                        #
+                        #  1. Get OSM time and UPK time from it to find time delay between those clocks
+                        #  2. Apply the delay to current UPK time to get OSM time - this time should be used to ITO
+                        logging.info(f'Setting ITO time based on OSM {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
+
+                    h1.instrument_utc_date_time = datetime_to_be_set
+                    logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
             except Exception as e:
-                logging.error(f'Some error during h1.instrument_utc_date_time - exception: {e.__doc__}')
+                logging.error(f'Some error during ITO date/time setting - exception: {e.__doc__}')
 
             # получение температуры прибора
             try:
-                pass
+                # Returns the temperature of the instrument on the PCB, 8 byte (double)
+                ito_board_temp = unpack('d', h1._execute_command("#GetBoardTemperature").content)[0]
+                logging.info(f'ITO board temperature {ito_board_temp}')
+
             except Exception as e:
                 logging.error(f'Some error during getting temperature - exception: {e.__doc__}')
 
@@ -300,21 +349,13 @@ def action_when_trigger_released(ito_reboot=False, reboot_by_netping=True):
     except Exception as e:
         logging.error(f'Exception during service start: {e.__doc__}')
 
+from struct import pack, unpack
 
 if __name__ == "__main__":
-    # default ini-values
-    data_dir_path = r'C:\OAISKGN_UPK\data'
-    dir_size_speed_threshold_mb_per_h = 8  # минимальная скорость прироста размера папки, при которой не будет перезапускаться служба
-    service_name = "OAISKGN_UPK"  # имя службы для перезапуска
-    dir_check_interval_sec = 60  # интервал проверки
-    num_of_triggers_before_action = 5  # количество срабатываний триггера до перезапуска службы
-    win_service_restart_interval_sec = 3600  # интервал безусловной перезагрузки службы
-    num_of_service_restarts_before_ito_reboot = 0  # количество перезапусков службы до перезагрузки прибора
-    max_unsuccessful_reboots = 3  # максимальное число перезапусков ИТО (неудачных подряд)
-    netping_relay_address = ''
-    netping_relay_ito_socket_num = 0
-    reboot_by_netping = True
 
+    # ini-file reading
+    config = None
+    ini_file_name = ""
     try:
         filename, file_extension = os.path.splitext(sys.argv[0])
         ini_file_name = f"{filename}.ini"
@@ -324,12 +365,42 @@ if __name__ == "__main__":
         config = configparser.ConfigParser()
 
         config.read(ini_file_name)
+    except Exception as e:
+        print(f'Fatal error during ini-file reading, cant read file{ini_file_name}\n{str(e)}')
+        sys.exit(0)
+
+    # Main settings
+    try:
 
         ini_file_version = config['main']['ini_file_version']
         instrument_description_filename = config['main']['instrument_description_filename']
         ITO_rebooting_duration_sec = float(config['main']['ITO_rebooting_duration_sec'])
         win_service_restart_pause = float(config['main']['win_service_restart_pause'])
 
+    except Exception as e:
+        print(f'Fatal error during ini-file reading [main] section: {str(e)}')
+        sys.exit(0)
+
+    # NetPing settings
+    netping_relay_address = ''
+    netping_relay_ito_socket_num = 0
+    reboot_by_netping = True
+    try:
+        netping_relay_address = config['netping']['netping_relay_address']  # '10.0.0.56'  # адрес управляемой розетки
+        netping_relay_ito_socket_num = int(config['netping']['netping_relay_ito_socket_num'])  # номер розетки, в которую воткнут ИТО
+    except KeyError as e:
+        print(f'Error during ini-file reading [netping] section, continue without netping: {str(e)}')
+        reboot_by_netping = False
+
+    # Trigger1 settings
+    data_dir_path = r'C:\OAISKGN_UPK\data'
+    dir_size_speed_threshold_mb_per_h = 8  # минимальная скорость прироста размера папки, при которой не будет перезапускаться служба
+    service_name = "OAISKGN_UPK"  # имя службы для перезапуска
+    dir_check_interval_sec = 60  # интервал проверки
+    num_of_triggers_before_action = 5  # количество срабатываний триггера до перезапуска службы
+    num_of_service_restarts_before_ito_reboot = 0  # количество перезапусков службы до перезагрузки прибора
+    max_unsuccessful_reboots = 3  # максимальное число перезапусков ИТО (неудачных подряд)
+    try:
         data_dir_path = config['trigger1']['data_dir_path']
         instrument_description_filename = data_dir_path + '\\' + instrument_description_filename
         files_template = config['trigger1']['files_template']
@@ -340,17 +411,22 @@ if __name__ == "__main__":
         num_of_service_restarts_before_ito_reboot = int(config['trigger1']['num_of_service_restarts_before_ito_reboot'])
         max_unsuccessful_reboots = int(config['trigger1']['max_unsuccessful_reboots'])
 
-        win_service_restart_interval_sec = float(config['trigger2']['win_service_restart_interval_sec'])
-
     except Exception as e:
-        print(f'Error during ini-file reading: {str(e)}')
+        print(f'Fatal error during ini-file reading [trigger1] section: {str(e)}')
         sys.exit(0)
+    else:
+        trigger1_enable = True
 
+    # Trigger2 settings
+    win_service_restart_interval_sec = 0
     try:
-        netping_relay_address = config['main']['netping_relay_address']  # '10.0.0.56'  # адрес управляемой розетки
-        netping_relay_ito_socket_num = int(config['main']['netping_relay_ito_socket_num'])  # номер розетки, в которую воткнут ИТО
-    except KeyError as e:
-        reboot_by_netping = False
+        win_service_restart_interval_sec = float(config['trigger2']['win_service_restart_interval_sec'])
+        ito_datetime_source = int(config['trigger2']['ito_datetime_source'])
+    except Exception as e:
+        print(f'Error during ini-file reading [trigger2] section, continue without trigger2: {str(e)}')
+        win_service_restart_interval_sec = 0
+    else:
+        trigger2_enable = True
 
     # check if data folder exist, create if not - for next log file
     try:
@@ -408,11 +484,12 @@ if __name__ == "__main__":
 
         # Trigger2 - release periodically
         try:
-            if (datetime.datetime.now().timestamp() - last_unconditional_reboot_time) >= win_service_restart_interval_sec > 0:
+            if trigger2_enable and (datetime.datetime.now().timestamp() - last_unconditional_reboot_time) >= win_service_restart_interval_sec > 0:
+
                 last_unconditional_reboot_time = datetime.datetime.now().timestamp()
 
                 logging.info('Trigger2 released')
-                action_when_trigger_released(False)
+                action_when_any_trigger_released(False)
 
                 cur_num_of_triggers = 0
                 num_of_service_restarts = 0
@@ -447,7 +524,7 @@ if __name__ == "__main__":
                             ITO_reboot_now = True
 
                         logging.info(f'Trigger1 released, reboot_ITO={ITO_reboot_now}')
-                        action_when_trigger_released(ito_reboot=ITO_reboot_now, reboot_by_netping=reboot_by_netping)
+                        action_when_any_trigger_released(ito_reboot=ITO_reboot_now, reboot_by_netping=reboot_by_netping)
                         num_of_service_restarts += 1
                     else:
                         cur_num_of_triggers += 1
