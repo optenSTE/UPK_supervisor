@@ -24,7 +24,7 @@ ini-файл
 ;*********************************
 
 ; this file version, should be the same as program version
-ini_file_version = 02.04.2021
+ini_file_version = 14.10.2021
 
 ; instrument description file, recommended instrument_description.json
 ; json-file with field 'IP_address' - contains ITO ip address, used to reboot it
@@ -97,7 +97,7 @@ ito_datetime_source = 1
 
 """
 
-import datetime
+from datetime import datetime
 import glob
 import os
 import time
@@ -111,6 +111,7 @@ import socket
 import win32api
 import configparser
 from netpingrelay import NetpingRelay
+from struct import pack, unpack
 
 program_version = '14.10.2021'
 
@@ -118,6 +119,10 @@ program_version = '14.10.2021'
 cur_unsuccessful_reboots = 0
 trigger1_enable = False
 trigger2_enable = False
+
+# константы, отвечающие за получение текущего времени ОСМ из лог-файла UPK_server
+upk_server_log_files_template = "UPK_server_*.log"
+upk_log_valid_age_days = 60  # how many days log file can be used for time sync, older files ignored because they may contain wrong time
 
 
 def get_dir_size_bytes(template):
@@ -200,6 +205,51 @@ def ito_check_connection():
                     ret = (3, f'Exception during h1.get_channel_detection_setting(1): {e.__doc__}')
 
     return ret
+
+
+def get_upk_osm_time_from_log(in_str):
+    """
+    Функция разбирает строчку лога, содержащую сообщение от ОСМ и возвращает показания часов компьютеров - УПК и ОСМ
+    :param in_str: строчка из лог-файла
+    :return: расхождение часов компьютеров - УПК и ОСМ
+    """
+    # 1.Распарсить входную строку на две даты/время
+    # 2.Перевести время в datetime
+    # 3.Вычислить расхождение
+
+    osm_time = upk_time = None
+
+    if 'opcode=9' not in in_str:
+        raise ValueError('The string from log should contains "opcode=9"')
+
+    # 1.Распарсить входную строку на две даты/время
+    #  u'%(filename)s[LINE:%(lineno)d]# %(levelname)-8s [%(asctime)s]  %(message)s'
+    #  protocol.py[LINE:1053]# DEBUG    [2021-08-31 14:51:27,887]  server < Frame(fin=True, opcode=9, data=b'31.08.2021 14:55:54', rsv1=False, rsv2=False, rsv3=False)
+
+    try:
+        # в строке лога есть левая часть - от УПК и правая - от ОСМ
+        upk_str, osm_str = in_str.split('Frame', 1)
+
+        # анализ части от УПК. интересуют вторые квадратные скобки
+        upk_time_str = upk_str.split('[')[-1].split(',')[0]
+
+        # анализ части от ОСМ. там перечислены параметры - вытащим 'data'
+        osm_time_str = osm_str.split("data=b'")[-1].split("'")[0]
+    except:
+        raise ValueError(f'Wrong log string format - expected like protocol.py[LINE:1053]# DEBUG    [2021-08-31 14:51:27,887]  server < Frame(fin=True, opcode=9, data=b\'31.08.2021 14:55:54\', rsv1=False, rsv2=False, rsv3=False)"')
+
+    # 2.Перевести время в datetime
+    try:
+        osm_time = datetime.strptime(osm_time_str, "%d.%m.%Y %H:%M:%S")
+    except:
+        raise ValueError(f'Wrong data format for OSM time - expected "%d.%m.%Y %H:%M:%S", got "{osm_time_str}"')
+
+    try:
+        upk_time = datetime.strptime(upk_time_str, logging.Formatter.default_time_format)
+    except:
+        raise ValueError(f'Wrong data format for UPK time - expected "%Y-%m-%d %H:%M:%S", got "{upk_time_str}"')
+
+    return upk_time, osm_time
 
 
 def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
@@ -292,7 +342,8 @@ def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
 
                 logging.info('Saving spectra...')
                 k = zip(spectrum.wavelengths, *spectrum.data)
-                spectrum_file_name = datetime.datetime.now().strftime(f'{data_dir_path}\\%Y%m%d%H%M%S_spectrum.txt')
+                # ToDo для именования файла получать время из ИТО 
+                spectrum_file_name = datetime.now().strftime(os.path.join(data_dir_path,'%Y%m%d%H%M%S_spectrum.txt'))
                 with open(spectrum_file_name, 'w') as spectrum_file:
                     for i in k:
                         print('\t'.join(str(x) for x in i), file=spectrum_file)
@@ -304,21 +355,57 @@ def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
                 logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
 
                 if ito_datetime_source > 0:
-                    datetime_to_be_set = datetime.datetime.utcnow()
+                    datetime_to_be_set = datetime.utcnow()
 
                     # 1 - UPK (local) UTC-time
                     if ito_datetime_source == 1:
-                        datetime_to_be_set = datetime.datetime.utcnow()
+                        datetime_to_be_set = datetime.utcnow()
                         logging.info(f'Setting ITO time based on UPK(UTC) {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
 
                     # 2 - OSM UTC-time. Based on log-file where is Ping Frame (opcode=9) from OSM.
                     if ito_datetime_source == 2:
+                        # Метод коррекции времени на основе Ping-сообщений от ОСМ. В строчке существующего
+                        # лог-файла UPK_server есть информация о времени УПК и ОСМ на момент получения сообщения
+                        # Используя эти два времени, находим сдвиг и применяем его к текущему времени УПК
+                        # это будет ожидаемое текущее время ОСМ. Его и нужно установить на ИТО.
+
                         # Last log file should contain line with Ping Frame (opcode=9) from OSM.
                         #  "protocol.py[LINE:1053]# DEBUG    [2021-08-31 14:51:27,887]  server < Frame(fin=True, opcode=9, data=b'31.08.2021 14:55:54', rsv1=False, rsv2=False, rsv3=False)"
                         #
                         #  1. Get OSM time and UPK time from it to find time delay between those clocks
                         #  2. Apply the delay to current UPK time to get OSM time - this time should be used to ITO
-                        logging.info(f'Setting ITO time based on OSM {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
+                        logged_first_error = False
+                        # iterate on log-files in time creation order (the newest is first)
+                        for cur_log_file_name in sorted(glob.glob(os.path.join(data_dir_path, upk_server_log_files_template)),
+                                                        key=os.path.getctime, reverse=True):
+                            with open(cur_log_file_name) as f:
+                                # line with 'opcode=9' sorted backward (from newest)
+                                opcode9_lines = (line for line in reversed(list(f.readlines())) if 'opcode=9' in line)
+                                for line in opcode9_lines:
+                                    try:
+                                        # parse UPK and OSM time from log line
+                                        upk_time, osm_time = get_upk_osm_time_from_log(line)
+
+                                        # check is time information fresh enough?
+                                        if abs((datetime.now() - upk_time).days) < upk_log_valid_age_days:
+                                            # OSM (UTC) time prediction
+                                            osm_utcnow = datetime.utcnow() - (upk_time - osm_time)
+                                            
+                                            # this time will apply late
+                                            datetime_to_be_set = osm_utcnow
+                                            logging.info(f'Setting ITO time based on OSM {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
+                                            break
+
+                                        elif not logged_first_error:
+                                            logging.info(f"OSM time in log-file is not fresh enough, "
+                                                         f"{os.path.basename(cur_log_file_name)}")
+                                            logged_first_error = True
+
+                                    except Exception as e:
+                                        # log only once
+                                        if not logged_first_error:
+                                            logging.info(e)
+                                            logged_first_error = True
 
                     h1.instrument_utc_date_time = datetime_to_be_set
                     logging.info(f'Current ITO time {h1.instrument_utc_date_time.strftime("%d.%m.%Y %H:%M:%S")}')
@@ -349,7 +436,6 @@ def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
     except Exception as e:
         logging.error(f'Exception during service start: {e.__doc__}')
 
-from struct import pack, unpack
 
 if __name__ == "__main__":
 
@@ -438,7 +524,7 @@ if __name__ == "__main__":
         print(f"Can't create folder {data_dir_path}: {str(e)}")
         sys.exit(0)
 
-    log_file_name = datetime.datetime.now().strftime(f'{data_dir_path}\\UPK_supervisor_%Y%m%d%H%M%S.log')
+    log_file_name = datetime.now().strftime(f'{data_dir_path}\\UPK_supervisor_%Y%m%d%H%M%S.log')
     logging.basicConfig(format=u'%(filename)s[LINE:%(lineno)d]# %(levelname)-8s [%(asctime)s]  %(message)s',
                         level=logging.DEBUG, filename=log_file_name)
 
@@ -453,8 +539,8 @@ if __name__ == "__main__":
             if len(line) > 1:
                 logging.info('\t' + line.strip())
 
-    last_dir_check_time = datetime.datetime.now().timestamp()
-    last_unconditional_reboot_time = datetime.datetime.now().timestamp()
+    last_dir_check_time = datetime.now().timestamp()
+    last_unconditional_reboot_time = datetime.now().timestamp()
     cur_dir_size = 0
     last_dir_size = 0
     cur_num_of_triggers = 0
@@ -484,9 +570,9 @@ if __name__ == "__main__":
 
         # Trigger2 - release periodically
         try:
-            if trigger2_enable and (datetime.datetime.now().timestamp() - last_unconditional_reboot_time) >= win_service_restart_interval_sec > 0:
+            if trigger2_enable and (datetime.now().timestamp() - last_unconditional_reboot_time) >= win_service_restart_interval_sec > 0:
 
-                last_unconditional_reboot_time = datetime.datetime.now().timestamp()
+                last_unconditional_reboot_time = datetime.now().timestamp()
 
                 logging.info('Trigger2 released')
                 action_when_any_trigger_released(False)
@@ -499,13 +585,13 @@ if __name__ == "__main__":
         # Trigger1 - data folder surveillance
         try:
             # is the moment to check data folder?
-            if (datetime.datetime.now().timestamp() - last_dir_check_time) >= dir_check_interval_sec:
+            if (datetime.now().timestamp() - last_dir_check_time) >= dir_check_interval_sec:
                 cur_dir_size = get_dir_size_bytes(data_dir_path + '\\' + files_template)
 
-                time_diff_sec = datetime.datetime.now().timestamp() - last_dir_check_time
+                time_diff_sec = datetime.now().timestamp() - last_dir_check_time
                 dir_size_diff_byte = cur_dir_size - last_dir_size
 
-                last_dir_check_time = datetime.datetime.now().timestamp()
+                last_dir_check_time = datetime.now().timestamp()
                 last_dir_size = cur_dir_size
 
                 if time_diff_sec <= 0:
