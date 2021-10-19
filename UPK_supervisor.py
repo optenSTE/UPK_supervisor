@@ -24,7 +24,7 @@ ini-файл
 ;*********************************
 
 ; this file version, should be the same as program version
-ini_file_version = 14.10.2021
+ini_file_version = 19.10.2021
 
 ; instrument description file, recommended instrument_description.json
 ; json-file with field 'IP_address' - contains ITO ip address, used to reboot it
@@ -92,7 +92,7 @@ win_service_restart_interval_sec = 3600
 ; ITO time correction when trigger2 released, recommended  1
 ; 0 - no correction
 ; 1 - UPK (local) UTC-time
-; not released: 2 - OSM UTC-time. Based on log-file where is Ping Frame (opcode=9) from OSM.
+; 2 - OSM UTC-time. Based on log-file where is Ping Frame (opcode=9) from OSM.
 ito_datetime_source = 1
 
 """
@@ -113,7 +113,7 @@ import configparser
 from netpingrelay import NetpingRelay
 from struct import pack, unpack
 
-program_version = '14.10.2021'
+program_version = '19.10.2021'
 
 # Глобальные переменные
 cur_unsuccessful_reboots = 0
@@ -342,7 +342,7 @@ def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
 
                 logging.info('Saving spectra...')
                 k = zip(spectrum.wavelengths, *spectrum.data)
-                # ToDo для именования файла получать время из ИТО 
+                # ToDo для именования файла получать время из ИТО
                 spectrum_file_name = datetime.now().strftime(os.path.join(data_dir_path,'%Y%m%d%H%M%S_spectrum.txt'))
                 with open(spectrum_file_name, 'w') as spectrum_file:
                     for i in k:
@@ -390,7 +390,7 @@ def action_when_any_trigger_released(ito_reboot=False, reboot_by_netping=True):
                                         if abs((datetime.now() - upk_time).days) < upk_log_valid_age_days:
                                             # OSM (UTC) time prediction
                                             osm_utcnow = datetime.utcnow() - (upk_time - osm_time)
-                                            
+
                                             # this time will apply late
                                             datetime_to_be_set = osm_utcnow
                                             logging.info(f'Setting ITO time based on OSM {datetime_to_be_set.strftime("%d.%m.%Y %H:%M:%S")}')
